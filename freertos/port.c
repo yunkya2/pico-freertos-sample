@@ -143,6 +143,8 @@ StackType_t * pxPortInitialiseStack( StackType_t * pxTopOfStack,
     *pxTopOfStack = ( StackType_t ) portTASK_RETURN_ADDRESS; /* LR */
     pxTopOfStack -= 5;                                       /* R12, R3, R2 and R1. */
     *pxTopOfStack = ( StackType_t ) pvParameters;            /* R0 */
+    pxTopOfStack -= 6;                                       /* RP2040 Divider registers */
+    *pxTopOfStack = ( StackType_t ) 0;                       /* no need to save context */
     pxTopOfStack -= 8;                                       /* R11..R4. */
 
     return pxTopOfStack;
@@ -192,7 +194,7 @@ void vPortStartFirstTask( void )
         "	ldr  r2, pxCurrentTCBConst2	\n"/* Obtain location of pxCurrentTCB. */
         "	ldr  r3, [r2]				\n"
         "	ldr  r0, [r3]				\n"/* The first item in pxCurrentTCB is the task top of stack. */
-        "	adds r0, #32					\n"/* Discard everything up to r0. */
+        "	adds r0, #(32 + 24)				\n"/* Discard everything up to r0. */
         "	msr  psp, r0					\n"/* This is now the new top of stack to use in the task. */
         "	movs r0, #2					\n"/* Switch to the psp stack. */
         "	msr  CONTROL, r0				\n"
@@ -316,8 +318,9 @@ void xPortPendSVHandler( void )
         "										\n"
         "	ldr	r3, pxCurrentTCBConst			\n"/* Get the location of the current TCB. */
         "	ldr	r2, [r3]						\n"
+        "	ldr	r1, SIOBASE						\n"/* RP2040 SIO base address */
         "										\n"
-        "	subs r0, r0, #32					\n"/* Make space for the remaining low registers. */
+        "	subs r0, r0, #(32 + 24)				\n"/* Make space for the remaining low registers. */
         "	str r0, [r2]						\n"/* Save the new top of stack. */
         "	stmia r0!, {r4-r7}					\n"/* Store the low registers that are not saved automatically. */
         " 	mov r4, r8							\n"/* Store the high registers. */
@@ -325,6 +328,21 @@ void xPortPendSVHandler( void )
         " 	mov r6, r10							\n"
         " 	mov r7, r11							\n"
         " 	stmia r0!, {r4-r7}					\n"
+        "										\n"
+        "	ldr r4, [r1, #0x78]					\n"/* SIO:DIV_CSR */
+        " 	stmia r0!, {r4-r5}					\n"
+        " 	lsrs r4, #2							\n"
+        " 	bcc 2f								\n"/* not DIRTY ? */
+        "1:										\n"
+        "	ldr r4, [r1, #0x78]					\n"/* SIO:DIV_CSR */
+        " 	lsrs r4, #1							\n"
+        " 	bcc 1b								\n"/* not READY ? */
+        "	ldr r4, [r1, #0x60]					\n"/* SIO:DIV_UDIVIDEND */
+        "	ldr r5, [r1, #0x64]					\n"/* SIO:DIV_UDIVISOR */
+        "	ldr r6, [r1, #0x74]					\n"/* SIO:DIV_REMAINDER */
+        "	ldr r7, [r1, #0x70]					\n"/* SIO:DIV_QUOTIENT */
+        " 	stmia r0!, {r4-r7}					\n"/* Save RP2040 divider context */
+        "2:										\n"
         "										\n"
         "	push {r3, r14}						\n"
         "	cpsid i								\n"
@@ -334,14 +352,29 @@ void xPortPendSVHandler( void )
         "										\n"
         "	ldr r1, [r2]						\n"
         "	ldr r0, [r1]						\n"/* The first item in pxCurrentTCB is the task top of stack. */
-        "	adds r0, r0, #16					\n"/* Move to the high registers. */
+
+        "	adds r0, r0, #32					\n"/* Move to RP2040 context */
+        "	ldmia r0!, {r4-r5}					\n"/* Pop saved divider status */
+        " 	lsrs r4, #2							\n"
+        " 	bcc 3f								\n"/* not DIRTY ? */
+
+        "	ldr r1, SIOBASE						\n"/* RP2040 SIO base address */
+        "	ldmia r0!, {r4-r7}					\n"/* Pop RP2040 divider context */
+        "	str r4, [r1, #0x60]					\n"/* SIO:DIV_UDIVIDEND */
+        "	str r5, [r1, #0x64]					\n"/* SIO:DIV_UDIVISOR */
+        "	str r6, [r1, #0x74]					\n"/* SIO:DIV_REMAINDER */
+        "	str r7, [r1, #0x70]					\n"/* SIO:DIV_QUOTIENT */
+        "	subs r0, r0, #16					\n"
+        "3:										\n"
+        "	adds r0, r0, #16					\n"/* Move to new top of stack */
+        "	msr psp, r0							\n"/* Remember the new top of stack for the task. */
+
+        "	subs r0, r0, #(24 + 16)				\n"/* Move to the high registers. */
         "	ldmia r0!, {r4-r7}					\n"/* Pop the high registers. */
         " 	mov r8, r4							\n"
         " 	mov r9, r5							\n"
         " 	mov r10, r6							\n"
         " 	mov r11, r7							\n"
-        "										\n"
-        "	msr psp, r0							\n"/* Remember the new top of stack for the task. */
         "										\n"
         "	subs r0, r0, #32					\n"/* Go back for the low registers that are not automatically restored. */
         " 	ldmia r0!, {r4-r7}					\n"/* Pop low registers.  */
@@ -349,7 +382,8 @@ void xPortPendSVHandler( void )
         "	bx r3								\n"
         "										\n"
         "	.align 4							\n"
-        "pxCurrentTCBConst: .word pxCurrentTCB	  "
+        "pxCurrentTCBConst: .word pxCurrentTCB	\n"
+        "SIOBASE:			.word 0xd0000000	  "
     );
 }
 /*-----------------------------------------------------------*/
